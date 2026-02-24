@@ -8,9 +8,11 @@ batch_size = 32
 block_size = 8
 max_iters = 300
 eval_interval = 300
-learning_rate = 1e-2
+learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
+n_embd = 32
+head_size = 16
 
 with open ('input.txt', 'r') as f:
     text = f.read()
@@ -90,16 +92,46 @@ for b in range(batch_size):
 
 torch.manual_seed(1337)
 
+class Head(nn.Module):
+
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size,bias=False)
+        self.query = nn.Linear(n_embd, head_size,bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril',torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, x):
+        B,T,C = x.shape
+        k = self.key(x)
+        q = self.query(x)
+
+        wei = q @ k.transpose(-2,-1) * C**-0.5# (B,T,16) @ (B,16,T) ---->(B,T,T)
+        wei = wei.masked_fill(self.tril [:T,:T] == 0 , float('-inf'))# Decoder block makes sure there's no communication with future
+        wei = F.softmax(wei, dim=-1)
+
+        v = self.value(x)
+        out = wei @ v# (B,T,T) @ (B,T,C) ----> (B,T,C)
+        return out
+
 class BigramLanguageModel(nn.Module):
 
-    def __init__(self, vocab_size):
+    def __init__(self):
         super().__init__()
         #each token directly reads off the logits for the next token from a lookup table
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.pos_embedding_table = nn.Embedding(block_size, n_embd)
+        self.sa_head = Head(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, target = None):
+        B, T = idx.shape
         #idx and target are both (B,T) tensors of integers]
-        logits  = self.token_embedding_table(idx)
+        token_emb  = self.token_embedding_table(idx)#(B,T,C)
+        pos_emb = self.pos_embedding_table(torch.arange(T, device=device))
+        x = token_emb + pos_emb
+        x = self.sa_head(x)#appliying one head of self attention. (B,T,C)
+        logits = self.lm_head(x)#(B,T,vocab_size)
         if target is None:
             loss = None
         else:
@@ -111,8 +143,10 @@ class BigramLanguageModel(nn.Module):
 
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
+            # crop idx to the last blok_size tokens
+            idx_cond = idx[:, -block_size:]
             # get predictions
-            logits, loss = self(idx)
+            logits, loss = self(idx_cond)
             # focus on the last time step
             logits = logits[:, -1, :]
             # apply softmax to get probabilities
@@ -124,7 +158,9 @@ class BigramLanguageModel(nn.Module):
         return idx
 
 
-model = BigramLanguageModel(vocab_size)
+
+
+model = BigramLanguageModel()
 m = model.to(device)
 out = m(Xb,Yb)
 
@@ -147,5 +183,29 @@ for step in range(steps):
 context = torch.zeros((1,1), dtype=torch.long, device=device)
 print(decoder(m.generate(context,max_new_tokens = 500)[0].tolist()))
 
-#mathematical trick in self-attention
-B,T,C = 4,8,2# Batch, Time, Channel
+# #Self-Attention
+# B,T,C = 4,8,32# Batch, Time, Channel
+# x = torch.randn((B,T,C))
+#
+# #Head of self attention
+# head_size = 16
+# key = nn.Linear(C,head_size, bias=False)
+# query = nn.Linear(C,head_size, bias=False)
+# value = nn.Linear(C, head_size, bias=False)
+# k = key(x) #(B, T , 16)
+# q = query(x)#(B, T , 16)
+# v = value(x)#(B, T , 16)
+# wei = q @ k.transpose(-2,-1)#(B,T.16) @ (B,16 ,T) ----> (B,T,T)
+#
+# tril = torch.tril(torch.ones(T,T))
+# # wei = torch.zeros(T,T)
+# wei = wei.masked_fill(tril == 0,float('-inf'))
+# wei = F.softmax(wei, dim = -1)
+# out = wei @ v
+# print(f'Weights = {wei}')
+# torch.manual_seed(42)
+# a = torch.tril(torch.randn((3,3),device=device))
+# a = torch.abs(a)/ torch.sum(torch.abs(a),1,keepdim=True)
+# b = torch.randint(0,10,(3,2)).float()
+# c = a @ b
+# print(f'A = {a}         B = {b}        C = {c}')
