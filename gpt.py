@@ -4,16 +4,20 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 #hyperparameters
-batch_size = 32
-block_size = 8
-max_iters = 300
+batch_size = 64 # how many independent sequences will be process parallel
+block_size = 256
+max_iters = 5000
 eval_interval = 300
-learning_rate = 1e-3
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device}")
+print(f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None'}")
 eval_iters = 200
-n_embd = 32
-head_size = 16
-
+n_embd = 384
+n_heads = 6
+n_layers = 6
+dropout = 0.2
+#------------------------------------------
 with open ('input.txt', 'r') as f:
     text = f.read()
 print(len(text))
@@ -46,7 +50,7 @@ y = train_data[1:block_size+1]
 for i in range(block_size):
     context = x[:i+1]
     target = y[i]
-    print(f"when the context is{context}, the target is [{target}]")
+    # print(f"when the context is{context}, the target is [{target}]")
 
 #intoducing batch, with that we can feed multiple text batches then in GPU the transformer can process multiple batches simultaneously
 torch.manual_seed(1337)
@@ -76,19 +80,19 @@ def estimate_loss():
     return out
 
 Xb , Yb = get_batch('train')
-print('inputs:')
-print(Xb.shape)
-print(Xb)
-
-print('targets:')
-print(Yb.shape)
-print(Yb)
+# print('inputs:')
+# print(Xb.shape)
+# print(Xb)
+#
+# print('targets:')
+# print(Yb.shape)
+# print(Yb)
 
 for b in range(batch_size):
     for t in range(block_size):
         context = Xb[b , :t +1]
         target = Yb[b , t]
-        print(f"when the context is{context}, the target is [{target}]")
+        # print(f"when the context is{context}, the target is [{target}]")
 
 torch.manual_seed(1337)
 
@@ -101,6 +105,8 @@ class Head(nn.Module):
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril',torch.tril(torch.ones(block_size, block_size)))
 
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
         B,T,C = x.shape
         k = self.key(x)
@@ -109,6 +115,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2,-1) * C**-0.5# (B,T,16) @ (B,16,T) ---->(B,T,T)
         wei = wei.masked_fill(self.tril [:T,:T] == 0 , float('-inf'))# Decoder block makes sure there's no communication with future
         wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
 
         v = self.value(x)
         out = wei @ v# (B,T,T) @ (B,T,C) ----> (B,T,C)
@@ -119,10 +126,11 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.head = nn.ModuleList([Head(head_size)for _ in range (num_heads)])
         self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self,x):
         out = torch.cat([h(x) for h in self.head], dim = -1)
-        out = self.proj(out)
+        out = self.dropout(self.proj(out))
         return out
 
 class FeedForward(nn.Module):
@@ -131,7 +139,8 @@ class FeedForward(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(n_embd,4 * n_embd),
             nn.ReLU(),
-            nn.Linear(4 * n_embd,n_embd)
+            nn.Linear(4 * n_embd,n_embd),
+            nn.Dropout(dropout)
         )
     def forward(self,x):
         return self.net(x)
@@ -142,10 +151,12 @@ class Block(nn.Module):
         head_size = n_embd // n_heads
         self.sa = MultiHeadAttention(n_heads, head_size)
         self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self,x):
-        x = x + self.sa(x)
-        x = x + self.ffwd(x)
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
         return x
 
 class BigramLanguageModel(nn.Module):
@@ -155,11 +166,8 @@ class BigramLanguageModel(nn.Module):
         #each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.pos_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(
-            Block(n_embd, n_heads=4),
-            Block(n_embd, n_heads=4),
-            Block(n_embd, n_heads=4)
-        )
+        self.blocks = nn.Sequential(*[Block(n_embd, n_heads) for _ in range(n_layers)])
+        self.ln_f = nn.LayerNorm(n_embd) # Final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, target = None):
@@ -208,7 +216,7 @@ steps = 10000
 for step in range(steps):
     if step % eval_interval == 0:
         losses = estimate_loss()
-        print(f"step: {step}, Train loss: {losses['train']:.4f}, Validation loss: {losses['val']:.4f}")
+        print(f"step: {step}, Train loss: {losses ['train']:.4f}, Validation loss: {losses['val']:.4f}")
     #sample a batch of data
     Xb , Yb = get_batch('train')
     #evaluate the loss
